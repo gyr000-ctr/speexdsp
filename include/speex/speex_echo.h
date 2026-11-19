@@ -59,6 +59,25 @@ extern "C" {
 /** Get impulse response (int32[]) */
 #define SPEEX_ECHO_GET_IMPULSE_RESPONSE 29
 
+/** Maximum extra far-end delay, expressed in frames, that can be configured
+ * through #SPEEX_ECHO_SET_DELAY. The delay line is allocated once when the
+ * state is created, so the extra memory has a fixed upper bound regardless
+ * of the delay actually configured. */
+#define SPEEX_ECHO_MAX_DELAY_FRAMES 50
+
+/** Set the extra far-end (playback) alignment delay in samples (int32).
+ * The reference signal fed to the canceller is delayed by that many samples
+ * before adaptation, to compensate for buffering/latency on the playback
+ * path (e.g. an external speaker). Valid range is 0 to the value returned by
+ * #SPEEX_ECHO_GET_MAX_DELAY; 0 restores the default behaviour.
+ * @return 0 on success, -2 if the delay is out of range */
+#define SPEEX_ECHO_SET_DELAY 30
+/** Get the currently configured extra far-end delay in samples (int32) */
+#define SPEEX_ECHO_GET_DELAY 31
+/** Get the maximum configurable extra delay in samples (int32), equal to
+ * #SPEEX_ECHO_MAX_DELAY_FRAMES times the frame size */
+#define SPEEX_ECHO_GET_MAX_DELAY 32
+
 /** Internal echo canceller state. Should never be accessed directly. */
 struct SpeexEchoState_;
 

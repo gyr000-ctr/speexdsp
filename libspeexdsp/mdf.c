@@ -182,7 +182,42 @@ struct SpeexEchoState_ {
    spx_int16_t *play_buf;
    int play_buf_pos;
    int play_buf_started;
+
+   /* Configurable extra far-end alignment delay (see speex_echo_ctl) */
+   int delay_samples;          /**< Currently applied extra delay, in samples */
+   int max_delay_samples;      /**< Upper bound on delay_samples, in samples */
+   spx_int16_t *delay_line;    /**< Far-end delay line, (SPEEX_ECHO_MAX_DELAY_FRAMES+1) frames per speaker */
+   int delay_line_pos;         /**< Write position (next sample) in the delay line */
+   spx_int16_t *delayed_frame; /**< Scratch for one delayed far-end frame (interleaved, K*frame_size) */
 };
+
+/** Push one frame of far-end data into the per-speaker delay line and pull a
+ *  frame delayed by st->delay_samples samples. The delay line is a single
+ *  circular buffer of (SPEEX_ECHO_MAX_DELAY_FRAMES+1)*frame_size samples per
+ *  speaker, so the delay is always bounded by st->max_delay_samples. */
+static void echo_delay_line_push(SpeexEchoState *st, const spx_int16_t *far_end, spx_int16_t *delayed)
+{
+   int line_len = (SPEEX_ECHO_MAX_DELAY_FRAMES+1)*st->frame_size;
+   int i, speak;
+   for (speak = 0; speak < st->K; speak++)
+   {
+      spx_int16_t *line = st->delay_line + speak*line_len;
+      const spx_int16_t *in = far_end + speak;
+      spx_int16_t *out = delayed + speak;
+      int pos = st->delay_line_pos;
+      /* Read position of the first output sample: the slot holding the sample
+         written delay_samples samples ago */
+      int read = (pos - st->delay_samples + line_len) % line_len;
+      for (i=0;i<st->frame_size;i++)
+      {
+         line[pos] = in[i*st->K];
+         out[i*st->K] = line[read];
+         pos = (pos+1) % line_len;
+         read = (read+1) % line_len;
+      }
+   }
+   st->delay_line_pos = (st->delay_line_pos + st->frame_size) % line_len;
+}
 
 static inline void filter_dc_notch16(const spx_int16_t *in, spx_word16_t radius, spx_word16_t *out, int len, spx_mem_t *mem, int stride)
 {
@@ -517,6 +552,14 @@ EXPORT SpeexEchoState *speex_echo_state_init_mc(int frame_size, int filter_lengt
    st->play_buf_pos = PLAYBACK_DELAY*st->frame_size;
    st->play_buf_started = 0;
 
+   st->delay_samples = 0;
+   st->max_delay_samples = SPEEX_ECHO_MAX_DELAY_FRAMES*st->frame_size;
+   st->delay_line = (spx_int16_t*)speex_alloc(K*(SPEEX_ECHO_MAX_DELAY_FRAMES+1)*st->frame_size*sizeof(spx_int16_t));
+   for (i=0;i<K*(SPEEX_ECHO_MAX_DELAY_FRAMES+1)*st->frame_size;i++)
+      st->delay_line[i] = 0;
+   st->delay_line_pos = 0;
+   st->delayed_frame = (spx_int16_t*)speex_alloc(K*st->frame_size*sizeof(spx_int16_t));
+
    return st;
 }
 
@@ -577,6 +620,10 @@ EXPORT void speex_echo_state_reset(SpeexEchoState *st)
    st->play_buf_pos = PLAYBACK_DELAY*st->frame_size;
    st->play_buf_started = 0;
 
+   for (i=0;i<st->K*(SPEEX_ECHO_MAX_DELAY_FRAMES+1)*st->frame_size;i++)
+      st->delay_line[i] = 0;
+   st->delay_line_pos = 0;
+
 }
 
 /** Destroys an echo canceller state */
@@ -617,6 +664,8 @@ EXPORT void speex_echo_state_destroy(SpeexEchoState *st)
    speex_free(st->notch_mem);
 
    speex_free(st->play_buf);
+   speex_free(st->delay_line);
+   speex_free(st->delayed_frame);
    speex_free(st);
 
 #ifdef DUMP_ECHO_CANCEL_DATA
@@ -703,6 +752,14 @@ EXPORT void speex_echo_cancellation(SpeexEchoState *st, const spx_int16_t *in, c
    M = st->M;
    C = st->C;
    K = st->K;
+
+   /* Apply the configurable far-end alignment delay. With a zero delay the
+      far-end pointer is untouched, preserving the zero-delay path bit for bit. */
+   if (st->delay_samples > 0)
+   {
+      echo_delay_line_push(st, far_end, st->delayed_frame);
+      far_end = st->delayed_frame;
+   }
 
    st->cancel_count++;
 #ifdef FIXED_POINT
@@ -1222,6 +1279,7 @@ void speex_echo_get_residual(SpeexEchoState *st, spx_word32_t *residual_echo, in
 
 EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
 {
+   int i;
    switch(request)
    {
 
@@ -1247,6 +1305,25 @@ EXPORT int speex_echo_ctl(SpeexEchoState *st, int request, void *ptr)
          break;
       case SPEEX_ECHO_GET_SAMPLING_RATE:
          (*(int*)ptr) = st->sampling_rate;
+         break;
+      case SPEEX_ECHO_SET_DELAY:
+      {
+         int delay = (*(int*)ptr);
+         if (delay < 0 || delay > st->max_delay_samples)
+            return -2;
+         st->delay_samples = delay;
+         /* Restart from an empty line so stale samples cannot be mixed in
+            after a delay reconfiguration */
+         for (i=0;i<st->K*(SPEEX_ECHO_MAX_DELAY_FRAMES+1)*st->frame_size;i++)
+            st->delay_line[i] = 0;
+         st->delay_line_pos = 0;
+         break;
+      }
+      case SPEEX_ECHO_GET_DELAY:
+         (*(int*)ptr) = st->delay_samples;
+         break;
+      case SPEEX_ECHO_GET_MAX_DELAY:
+         (*(int*)ptr) = st->max_delay_samples;
          break;
       case SPEEX_ECHO_GET_IMPULSE_RESPONSE_SIZE:
          /*FIXME: Implement this for multiple channels */
