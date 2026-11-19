@@ -224,7 +224,7 @@ struct SpeexPreprocessState_ {
    spx_word16_t *inbuf;      /**< Input buffer (overlapped analysis) */
    spx_word16_t *outbuf;     /**< Output buffer (for overlap and add) */
 
-   /* AGC stuff, only for floating point for now */
+   /* AGC stuff */
 #ifndef FIXED_POINT
    int    agc_enabled;
    float  agc_level;
@@ -237,6 +237,16 @@ struct SpeexPreprocessState_ {
    float  max_decrease_step; /**< Maximum decrease in gain from one frame to another */
    float  prev_loudness;     /**< Loudness of previous frame */
    float  init_max;          /**< Current gain limit during initialisation */
+#else
+   /* All fixed-point AGC quantities are integer scaled; no float is ever used */
+   int    agc_enabled;
+   spx_int32_t agc_level;    /**< Target RMS amplitude (natural 16-bit units) */
+   spx_word32_t agc_gain;    /**< Current AGC gain in Q10 */
+   spx_word32_t max_gain;    /**< Maximum gain allowed in Q10 */
+   spx_word32_t max_increase_step; /**< Max per-frame gain multiplier in Q10 */
+   spx_word32_t max_decrease_step; /**< Max per-frame gain multiplier in Q10 */
+   spx_word32_t rms_sm;      /**< Smoothed mean-square energy (natural units) */
+   spx_word16_t rms_frac;    /**< EMA weight for the new frame in Q15 */
 #endif
    int    nb_adapt;          /**< Number of frames used for adaptation so far */
    int    was_speech;
@@ -340,6 +350,172 @@ static void compute_gain_floor(int noise_suppress, int effective_echo_suppress, 
                                        spx_sqrt(SHL32(EXTEND32(DIV32_16_Q15(MULT16_32_Q15(gain_ratio,PSHR32(noise[i],NOISE_SHIFT)) + echo[i],
                                              (1+PSHR32(noise[i],NOISE_SHIFT) + echo[i]) )),15)));
    }
+}
+
+/* ---- Fixed-point AGC helpers (no floating point anywhere) ---- */
+
+/* Multiply two Q10 values; operands are bounded enough to fit in 16 bits */
+#define MULT_Q10(a,b) PSHR32(MULT16_16(EXTRACT16(a),EXTRACT16(b)),10)
+
+/* Convert a gain change rate in dB/second into a per-frame multiplier in Q10.
+   step = exp(0.11513 * db_per_sec * frame_size / sampling_rate). */
+static inline spx_word32_t speex_agc_step_q10(const SpeexPreprocessState *st, spx_int32_t db_per_sec)
+{
+   /* ratio = frame_size / sampling_rate in Q15 */
+   spx_word16_t ratio = PDIV32_16(SHL32(EXTEND32(st->frame_size),15), st->sampling_rate);
+   spx_word32_t arg;   /* exponent argument in Q11, as expected by spx_exp() */
+   /* 0.11513 (Q11) * ratio (Q15) -> Q11, then plain integer scale by dB/s */
+   arg = MULT16_16_P15(QCONST16(0.11513f,11), ratio);
+   arg = arg * db_per_sec;
+   /* spx_exp output is Q16, convert to Q10 */
+   return PSHR32(spx_exp(EXTRACT16(SATURATE32(arg,32767))),6);
+}
+
+/* exp(0.11513 * db) in Q10, used to turn a dB gain limit into a linear one. */
+static inline spx_word32_t speex_agc_db_to_q10(spx_int32_t db)
+{
+   spx_word32_t arg = EXTEND32(QCONST16(0.11513f,11)) * db; /* Q11 */
+   return PSHR32(spx_exp(EXTRACT16(SATURATE32(arg,32767))),6);
+}
+
+/* Integer square root of a non-negative 32-bit value (digit-by-digit). */
+static inline spx_word32_t speex_isqrt32(spx_word32_t value)
+{
+   spx_word32_t root = 0;
+   spx_word32_t bit;
+   if (value <= 0)
+      return 0;
+   bit = (spx_word32_t)1 << (spx_ilog2(EXTEND32(value)) & ~1);
+   while (bit != 0)
+   {
+      if (value >= root + bit)
+      {
+         value -= root + bit;
+         root = (root >> 1) + bit;
+      } else {
+         root >>= 1;
+      }
+      bit >>= 2;
+   }
+   return root;
+}
+
+/* Compute the mean square of the 2*N time-domain frame using only 32-bit
+   arithmetic: samples are scaled so neither the squared terms nor their
+   sum can overflow a signed 32-bit accumulator. */
+static spx_word32_t speex_agc_mean_square(const spx_word16_t *frame, int len)
+{
+   spx_word32_t max_abs = 0;
+   spx_word32_t shift, scale_sq;
+   spx_word32_t accum = 0;
+   int i;
+   for (i=0;i<len;i++)
+   {
+      spx_word32_t a = ABS16(frame[i]);
+      if (a > max_abs)
+         max_abs = a;
+   }
+   if (max_abs == 0)
+      return 0;
+   /* After shifting, every sample is below 2^10, so each squared term is
+      below 2^20 and the sum of at most 2048 terms stays below 2^31. */
+   shift = spx_ilog2(EXTEND32(max_abs)) - 9;
+   if (shift < 0)
+      shift = 0;
+   scale_sq = SHL32(EXTEND32(1), (int)(2*shift));
+   for (i=0;i<len;i++)
+   {
+      spx_word32_t v = SHR32(EXTEND32(frame[i]), shift);
+      accum += MULT16_16(EXTRACT16(v), EXTRACT16(v));
+   }
+   /* Undo the scaling on the mean (worst case: full-scale square < 2^31) */
+   return PDIV32(accum, len) * scale_sq;
+}
+
+/* Fixed-point AGC level estimation and gain update. Runs on the raw input
+   frame BEFORE the denoiser so the target tracks the incoming speech level
+   rather than the suppressed one. The resulting gain is applied later by
+   speex_agc_apply_fixed() on the final output samples. */
+static void speex_agc_update_fixed(SpeexPreprocessState *st, const spx_int16_t *input)
+{
+   int len = st->frame_size;
+   spx_word32_t frame_ms;
+   spx_word32_t rms;
+   spx_word32_t target_gain;
+   spx_word16_t w = st->rms_frac;
+
+   frame_ms = speex_agc_mean_square(input, len);
+
+   /* Exponential smoothing of the mean-square energy:
+      rms_sm = (1-w)*rms_sm + w*frame_ms */
+   st->rms_sm = MULT16_32_Q15(SUB16(Q15_ONE,w), st->rms_sm)
+              + MULT16_32_Q15(w, frame_ms);
+
+   rms = speex_isqrt32(st->rms_sm);
+
+   /* Desired gain = target / rms, computed in Q8 so the numerator cannot
+      overflow 32 bits; the result is converted back to Q10 afterwards. */
+   if (rms < 1)
+      rms = 1;
+   target_gain = PDIV32(SHL32(EXTEND32(st->agc_level),8), rms); /* Q8 */
+   if (target_gain > SHR32(st->max_gain,2))
+      target_gain = SHR32(st->max_gain,2);
+   target_gain = SHL32(target_gain,2);                          /* Q10 */
+
+   /* Limit the per-frame gain change (attack/release smoothing) */
+   if (target_gain > MULT_Q10(st->max_increase_step, st->agc_gain))
+      target_gain = MULT_Q10(st->max_increase_step, st->agc_gain);
+   if (target_gain < MULT_Q10(st->max_decrease_step, st->agc_gain))
+      target_gain = MULT_Q10(st->max_decrease_step, st->agc_gain);
+   st->agc_gain = target_gain;
+}
+
+/* Apply the previously computed gain to the final output samples. */
+static void speex_agc_apply_fixed(SpeexPreprocessState *st, spx_int16_t *out)
+{
+   int i;
+   int len = st->frame_size;
+   /* max_gain is capped at 30 dB (Q10 ~= 31622), so sample*gain stays below
+      2^31 and the PSHR32 result is saturated to the 16-bit output range. */
+   for (i=0;i<len;i++)
+   {
+      spx_word32_t y = PSHR32(MULT16_16(out[i], EXTRACT16(st->agc_gain)),10);
+      out[i] = EXTRACT16(SATURATE32(y, 32767));
+   }
+}
+
+/* Fixed-point log2 of a positive Q10 value, result in Q11.
+   Q11 keeps the whole supported gain range inside 16 bits, so the value
+   can be fed directly to the 16x16 multiply helpers. The fractional part
+   uses a piecewise-linear approximation (max error ~0.09). */
+static inline spx_word16_t speex_log2_q11(spx_word32_t x_q10)
+{
+   int e, f;
+   spx_word32_t mant_q15;
+   spx_word32_t frac;
+   if (x_q10 <= 0)
+      return 0;
+   f = spx_ilog2(EXTEND32(x_q10));
+   e = f - 10;
+   /* Bring the 2^f bit of x up to bit 15: mantissa in [32768, 65535] */
+   mant_q15 = SHL32(x_q10, 15 - f);
+   /* (mantissa - 1) represented in Q14 */
+   frac = SUB32(SHR32(mant_q15,1), QCONST32(1.f,14));
+   return EXTRACT16(SATURATE32(SHL32(EXTEND32(e),11) + SHR32(frac,3), 32767));
+}
+
+/* Recover a gain-change rate in dB/second from a per-frame step (Q10).
+   Uses the small-argument approximation ln(step) ~= step-1, which is
+   accurate for the per-frame multipliers produced by the bounded rates. */
+static inline spx_int32_t speex_agc_rate_db(spx_word32_t step_q10, const SpeexPreprocessState *st)
+{
+   /* ln(step) ~= (step - 1.0) represented in Q15 */
+   spx_word32_t ln_q15 = SHL32(SUB32(step_q10, QCONST16(1.f,10)),5);
+   /* Per-frame change in dB: ln(step)/0.11513, result in Q15 */
+   spx_word32_t per_frame = PSHR32(ln_q15 * QCONST32(8.68589f,15),15);
+   /* Frames per second in Q10 keeps the 32-bit product within range */
+   spx_word32_t ratio_q10 = PDIV32(SHL32(EXTEND32(st->sampling_rate),10), st->frame_size);
+   return PSHR32(per_frame * ratio_q10, 25);   /* Q15 * Q10 -> integer */
 }
 
 #else
@@ -516,6 +692,16 @@ EXPORT SpeexPreprocessState *speex_preprocess_state_init(int frame_size, int sam
    st->max_decrease_step = exp(-0.11513f * 40.*st->frame_size / st->sampling_rate);
    st->prev_loudness = 1;
    st->init_max = 1;
+#else
+   st->agc_enabled = 0;
+   st->agc_level = 8000;
+   st->agc_gain = QCONST16(1.f,10);          /* unity gain in Q10 */
+   st->max_gain = speex_agc_db_to_q10(30);   /* 30 dB headroom, matches float default */
+   /* Defaults: +12 dB/s attack, -40 dB/s release (same rates as the float path) */
+   st->max_increase_step = speex_agc_step_q10(st, 12);
+   st->max_decrease_step = speex_agc_step_q10(st, -40);
+   st->rms_sm = 0;
+   st->rms_frac = DIV32_16(Q15_ONE, 16);     /* EMA weight: 1/16 per frame */
 #endif
    st->was_speech = 0;
 
@@ -759,6 +945,12 @@ EXPORT int speex_preprocess_run(SpeexPreprocessState *st, spx_int16_t *x)
       for (i=0;i<N+M;i++)
          st->echo_noise[i] = 0;
    }
+#ifdef FIXED_POINT
+   /* Estimate the input level and update the AGC gain before denoising, so
+      the target follows the raw speech rather than the suppressed signal. */
+   if (st->agc_enabled)
+      speex_agc_update_fixed(st, x);
+#endif
    preprocess_analysis(st, x);
 
    update_noise_prob(st);
@@ -945,7 +1137,6 @@ EXPORT int speex_preprocess_run(SpeexPreprocessState *st, spx_int16_t *x)
    st->ft[0] = MULT16_16_P15(st->gain2[0],st->ft[0]);
    st->ft[2*N-1] = MULT16_16_P15(st->gain2[N-1],st->ft[2*N-1]);
 
-   /*FIXME: This *will* not work for fixed-point */
 #ifndef FIXED_POINT
    if (st->agc_enabled)
       speex_compute_agc(st, Pframe, st->ft);
@@ -987,6 +1178,17 @@ EXPORT int speex_preprocess_run(SpeexPreprocessState *st, spx_int16_t *x)
    /* Update outbuf */
    for (i=0;i<N3;i++)
       st->outbuf[i] = st->frame[st->frame_size+i];
+
+#ifdef FIXED_POINT
+   /* Fixed-point AGC: apply the gain (computed from the raw input level)
+      directly to the final output samples. Doing it here, after the WOLA
+      synthesis and overlap-add, makes the level correction independent of
+      the internal windowing scale and composes correctly with the denoiser,
+      whose gain is already baked into x. The 30 dB gain cap keeps the
+      16x16 product inside 32 bits; the result is saturated to 16 bits. */
+   if (st->agc_enabled)
+      speex_agc_apply_fixed(st, x);
+#endif
 
    /* FIXME: This VAD is a kludge */
    st->speech_prob = Pframe;
@@ -1091,6 +1293,58 @@ EXPORT int speex_preprocess_ctl(SpeexPreprocessState *state, int request, void *
    case SPEEX_PREPROCESS_GET_AGC_MAX_GAIN:
       (*(spx_int32_t*)ptr) = floor(.5+8.6858*log(st->max_gain));
       break;
+#else
+   case SPEEX_PREPROCESS_SET_AGC:
+      if (ptr==NULL)
+         return -1;
+      if (*(spx_int32_t*)ptr)
+         st->agc_enabled = 1;
+      else
+         st->agc_enabled = 0;
+      break;
+   case SPEEX_PREPROCESS_GET_AGC:
+      if (ptr==NULL)
+         return -1;
+      (*(spx_int32_t*)ptr) = st->agc_enabled;
+      break;
+#ifndef DISABLE_FLOAT_API
+   case SPEEX_PREPROCESS_SET_AGC_LEVEL:
+   case SPEEX_PREPROCESS_GET_AGC_LEVEL:
+      /* No float parameters in a fixed-point build; use the integer target */
+      return -1;
+#endif /* #ifndef DISABLE_FLOAT_API */
+   case SPEEX_PREPROCESS_SET_AGC_INCREMENT:
+      if (ptr==NULL || (*(spx_int32_t*)ptr)<=0 || (*(spx_int32_t*)ptr)>100)
+         return -1;
+      st->max_increase_step = speex_agc_step_q10(st, *(spx_int32_t*)ptr);
+      break;
+   case SPEEX_PREPROCESS_GET_AGC_INCREMENT:
+      if (ptr==NULL)
+         return -1;
+      (*(spx_int32_t*)ptr) = speex_agc_rate_db(st->max_increase_step, st);
+      break;
+   case SPEEX_PREPROCESS_SET_AGC_DECREMENT:
+      if (ptr==NULL || (*(spx_int32_t*)ptr)>=0 || (*(spx_int32_t*)ptr)<-100)
+         return -1;
+      st->max_decrease_step = speex_agc_step_q10(st, *(spx_int32_t*)ptr);
+      break;
+   case SPEEX_PREPROCESS_GET_AGC_DECREMENT:
+      if (ptr==NULL)
+         return -1;
+      (*(spx_int32_t*)ptr) = speex_agc_rate_db(st->max_decrease_step, st);
+      break;
+   case SPEEX_PREPROCESS_SET_AGC_MAX_GAIN:
+      if (ptr==NULL || (*(spx_int32_t*)ptr)<0 || (*(spx_int32_t*)ptr)>90)
+         return -1;
+      st->max_gain = speex_agc_db_to_q10(*(spx_int32_t*)ptr);
+      break;
+   case SPEEX_PREPROCESS_GET_AGC_MAX_GAIN:
+      if (ptr==NULL)
+         return -1;
+      /* dB = log2(gain) (Q11) * 6.0206 (Q11) -> integer via >>22 */
+      (*(spx_int32_t*)ptr) = PSHR32(MULT16_16(speex_log2_q11(st->max_gain),
+                                              QCONST16(6.0206f,11)),22);
+      break;
 #endif
    case SPEEX_PREPROCESS_SET_VAD:
       speex_warning("The VAD has been replaced by a hack pending a complete rewrite");
@@ -1174,6 +1428,20 @@ EXPORT int speex_preprocess_ctl(SpeexPreprocessState *state, int request, void *
    case SPEEX_PREPROCESS_GET_AGC_GAIN:
       (*(spx_int32_t*)ptr) = floor(.5+8.6858*log(st->agc_gain));
       break;
+#else
+   case SPEEX_PREPROCESS_GET_AGC_LOUDNESS:
+      if (ptr==NULL)
+         return -1;
+      /* Smoothed input RMS in natural 16-bit units (the "loudness" estimate) */
+      (*(spx_int32_t*)ptr) = speex_isqrt32(st->rms_sm);
+      break;
+   case SPEEX_PREPROCESS_GET_AGC_GAIN:
+      if (ptr==NULL)
+         return -1;
+      /* Current gain in dB: 20*log10(gain) = log2(gain) (Q11) * 6.0206 (Q11) */
+      (*(spx_int32_t*)ptr) = PSHR32(MULT16_16(speex_log2_q11(st->agc_gain),
+                                              QCONST16(6.0206f,11)),22);
+      break;
 #endif
    case SPEEX_PREPROCESS_GET_PSD_SIZE:
    case SPEEX_PREPROCESS_GET_NOISE_PSD_SIZE:
@@ -1199,6 +1467,19 @@ EXPORT int speex_preprocess_ctl(SpeexPreprocessState *state, int request, void *
          st->agc_level=32768;
       break;
    case SPEEX_PREPROCESS_GET_AGC_TARGET:
+      (*(spx_int32_t*)ptr) = st->agc_level;
+      break;
+#else
+   case SPEEX_PREPROCESS_SET_AGC_TARGET:
+      if (ptr==NULL)
+         return -1;
+      if (*(spx_int32_t*)ptr < 1 || *(spx_int32_t*)ptr > 32768)
+         return -1;
+      st->agc_level = *(spx_int32_t*)ptr;
+      break;
+   case SPEEX_PREPROCESS_GET_AGC_TARGET:
+      if (ptr==NULL)
+         return -1;
       (*(spx_int32_t*)ptr) = st->agc_level;
       break;
 #endif
