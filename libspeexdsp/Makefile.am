@@ -18,7 +18,7 @@ else
 endif
 endif
 
-libspeexdsp_la_SOURCES = preprocess.c jitter.c mdf.c fftwrap.c filterbank.c resample.c buffer.c scal.c $(FFTSRC)
+libspeexdsp_la_SOURCES = preprocess.c jitter.c jitter_stats.c mdf.c fftwrap.c filterbank.c resample.c buffer.c scal.c $(FFTSRC)
 
 noinst_HEADERS = 	arch.h 	bfin.h \
 		fixed_arm4.h \
@@ -32,13 +32,15 @@ libspeexdsp_la_LDFLAGS = -no-undefined -version-info @SPEEXDSP_LT_CURRENT@:@SPEE
 libspeexdsp_la_LIBADD = $(LIBM)
 
 if BUILD_EXAMPLES
-noinst_PROGRAMS = testdenoise testecho testjitter testresample testresample2
+noinst_PROGRAMS = testdenoise testecho testjitter test_jitter_stats testresample testresample2
 testdenoise_SOURCES = testdenoise.c
 testdenoise_LDADD = libspeexdsp.la @FFT_LIBS@
 testecho_SOURCES = testecho.c
 testecho_LDADD = libspeexdsp.la @FFT_LIBS@
 testjitter_SOURCES = testjitter.c
 testjitter_LDADD = libspeexdsp.la @FFT_LIBS@
+test_jitter_stats_SOURCES = test_jitter_stats.c
+test_jitter_stats_LDADD = libspeexdsp.la @FFT_LIBS@
 testresample_SOURCES = testresample.c
 testresample_LDADD = libspeexdsp.la @FFT_LIBS@ @LIBM@
 testresample2_SOURCES = testresample2.c
